@@ -1,0 +1,133 @@
+name: build-and-deploy
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      graphics:
+        description: "Graphics API for the build"
+        type: choice
+        options: [webgl2, webgpu]
+        default: webgl2
+
+env:
+  # RocketSim is only used as the reference for the parity test; it is pinned so the test is reproducible.
+  ROCKETSIM_REF: c2baacb8f4b441dd8505e63c2aeb5a1679b60b02
+
+jobs:
+  checks:
+    name: Static checks
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: JSON / YAML sanity
+        run: |
+          python3 -c "import json;json.load(open('Packages/manifest.json'));json.load(open('deploy/vercel.json'))"
+          python3 -c "import yaml;yaml.safe_load(open('.github/workflows/ci.yml'))"
+
+  parity:
+    name: Vehicle model vs native RocketSim
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with: { dotnet-version: 8.0.x }
+      - name: Fetch RocketSim (reference)
+        run: git clone https://github.com/ZealanL/RocketSim.git /tmp/RocketSim && git -C /tmp/RocketSim checkout "$ROCKETSIM_REF"
+      - name: Build both and compare every scenario
+        run: bash tools/parity/build.sh /tmp/RocketSim "$(nproc)"
+
+  unity-web:
+    name: Unity 6000.0.62f1 WebGL build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write        # lets the job push the build to the release branch
+    needs: [checks, parity]
+    outputs:
+      built: ${{ steps.lic.outputs.ok }}
+    steps:
+      - uses: actions/checkout@v4
+        with: { lfs: false }
+      - name: Check Unity license secrets
+        id: lic
+        env:
+          UNITY_LICENSE: ${{ secrets.UNITY_LICENSE }}
+          UNITY_SERIAL: ${{ secrets.UNITY_SERIAL }}
+        run: |
+          if [ -n "$UNITY_LICENSE" ] || [ -n "$UNITY_SERIAL" ]; then echo "ok=true" >> "$GITHUB_OUTPUT"; else echo "ok=false" >> "$GITHUB_OUTPUT"; echo "::warning::No UNITY_LICENSE/UNITY_SERIAL secret - skipping the Unity build. See README."; fi
+      - uses: actions/cache@v4
+        if: steps.lic.outputs.ok == 'true'
+        with:
+          path: Library
+          key: Library-WebGL-${{ hashFiles('Packages/manifest.json', 'Assets/**/*.cs') }}
+          restore-keys: Library-WebGL-
+      - uses: game-ci/unity-builder@v4
+        if: steps.lic.outputs.ok == 'true'
+        env:
+          UNITY_LICENSE: ${{ secrets.UNITY_LICENSE }}
+          UNITY_EMAIL: ${{ secrets.UNITY_EMAIL }}
+          UNITY_PASSWORD: ${{ secrets.UNITY_PASSWORD }}
+          UNITY_SERIAL: ${{ secrets.UNITY_SERIAL }}
+        with:
+          unityVersion: 6000.0.62f1
+          targetPlatform: WebGL
+          buildMethod: RocketWorld.Editor.BuildScript.BuildWebGL
+          customParameters: -rwGfx ${{ inputs.graphics == 'webgpu' && 'webgpu' || 'webgl2' }}
+          versioning: None
+          allowDirtyBuild: true
+      - name: Add Vercel config to the build output
+        if: steps.lic.outputs.ok == 'true'
+        run: |
+          # game-ci builds inside a root container: take ownership first. The player lands in build/WebGL/WebGL.
+          sudo chown -R "$(id -u):$(id -g)" build
+          cp deploy/vercel.json build/WebGL/WebGL/vercel.json
+          ls -la build/WebGL/WebGL build/WebGL/WebGL/Build
+      - uses: actions/upload-artifact@v4
+        if: steps.lic.outputs.ok == 'true'
+        with:
+          name: rocketworld-webgl
+          path: build/WebGL/WebGL
+      - name: Publish to the release branch (Vercel production branch)
+        if: steps.lic.outputs.ok == 'true' && github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+        uses: peaceiris/actions-gh-pages@v4
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          publish_branch: release
+          publish_dir: build/WebGL/WebGL
+          force_orphan: true
+          enable_jekyll: false
+          commit_message: "release ${{ github.sha }}"
+
+  # After the WebGL artifact is produced: unpack is handled by download-artifact,
+  # then the player is force-pushed to renatoehzproyectos/op-test (main).
+  deploy-op-test:
+    name: Deploy WebGL → op-test
+    runs-on: ubuntu-latest
+    needs: [unity-web]
+    if: needs.unity-web.outputs.built == 'true'
+    steps:
+      - name: Download rocketworld-webgl artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: rocketworld-webgl
+          path: webgl
+
+      - name: Show what will be published
+        run: |
+          echo "Contents of the WebGL player:"
+          find webgl -maxdepth 2 -type f | head -40
+          test -f webgl/index.html
+          test -d webgl/Build
+
+      - name: Push to renatoehzproyectos/op-test
+        uses: peaceiris/actions-gh-pages@v4
+        with:
+          personal_token: ${{ secrets.PAT }}
+          external_repository: renatoehzproyectos/op-test
+          publish_dir: ./webgl
+          publish_branch: main
+          force_orphan: true
+          enable_jekyll: false
+          commit_message: "deploy rocketworld-webgl from ${{ github.repository }}@${{ github.sha }}"
